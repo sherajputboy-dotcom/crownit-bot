@@ -1,0 +1,12 @@
+# Local environment files
+.env
+
+# Database file
+crownit_db.json
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
