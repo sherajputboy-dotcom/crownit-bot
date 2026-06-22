@@ -82,9 +82,7 @@ SURVEY_RESPONSES = [
 db_lock = asyncio.Lock()
 db_data = {
     "users": {},
-    "channels": [
-        {"username": "@slprolooters", "link": "https://t.me/slprolooters"}
-    ],
+    "channels": [], # Empty by default as requested
     "settings": {
         "force_join_enabled": True,
         "max_surveys_per_user": 2,
@@ -100,6 +98,11 @@ def load_db():
         if os.path.exists(DB_FILE):
             with open(DB_FILE, "r") as f:
                 data = json.load(f)
+                
+                # Dynamic cleanup: filter out the old `@slprolooters` channel if present in local file
+                if "channels" in data and isinstance(data["channels"], list):
+                    data["channels"] = [c for c in data["channels"] if c.get("username") != "@slprolooters"]
+                
                 # Ensure all key sections are populated
                 for key in ["users", "channels", "settings", "banned_users"]:
                     if key not in data:
@@ -142,6 +145,16 @@ def is_genuine_value(val) -> bool:
     if isinstance(val, bool):
         return val
     return True
+
+# Universal Message Text Editor (prevents Message vs CallbackQuery AttributeError crash)
+async def edit_msg(msg_or_query, text: str, reply_markup=None, parse_mode="Markdown"):
+    try:
+        if hasattr(msg_or_query, "edit_message_text"):
+            await msg_or_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await msg_or_query.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        logger.error(f"Error editing message: {e}")
 
 # HTTP Call Helpers using Async HTTPX Client
 def crownit_headers(auth_uid=None, auth_sid=None):
@@ -374,8 +387,7 @@ async def check_user_channels(user_id: int, bot) -> List[dict]:
             if member.status not in ["member", "administrator", "creator"]:
                 not_joined.append(c)
         except Exception as e:
-            logger.error(f"Error checking channel {username} member status: {e}. Treating as NOT joined.")
-            not_joined.append(c)
+            logger.error(f"Error checking channel {username} member status: {e}. Skipping check for this channel to prevent lockouts.")
     return not_joined
 
 def get_join_keyboard(not_joined_channels: List[dict]) -> InlineKeyboardMarkup:
@@ -465,11 +477,11 @@ active_sessions = {}
 async def run_surveys_and_claims(query, user_id: int, uid: str, sid: str, phone: str):
     """Core automated engine to run campaigns and handle retry mechanics."""
     async with httpx.AsyncClient(verify=False) as client:
-        await query.edit_message_text(
+        await edit_msg(
+            query,
             f"⚡ *ENGINE STARTED*\n"
             f"════════════════════════════\n"
-            f"📋 *Fetching eligible surveys from Crownit...*",
-            parse_mode="Markdown"
+            f"📋 *Fetching eligible surveys from Crownit...*"
         )
         surveys_resp = await crownit_post(client, "/rer/pwa/eligible", {}, uid, sid)
         surveys = surveys_resp.get("result", [])
@@ -480,36 +492,36 @@ async def run_surveys_and_claims(query, user_id: int, uid: str, sid: str, phone:
         survey_failed = False
         if isinstance(surveys, list) and len(surveys) > 0:
             count = min(len(surveys), limit)
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 f"⚡ *SURVEY RUNNER*\n"
                 f"════════════════════════════\n"
-                f"📋 Found `{len(surveys)}` surveys. Running `{count}` campaign(s)...",
-                parse_mode="Markdown"
+                f"📋 Found `{len(surveys)}` surveys. Running `{count}` campaign(s)..."
             )
             
             for i, s in enumerate(surveys[:count]):
                 category_name = s.get("category", "General survey")
-                await query.edit_message_text(
+                await edit_msg(
+                    query,
                     f"📝 *Taking Survey {i+1}/{count}:* `{category_name}`\n"
-                    f"⏳ Anti-bot delays active. Please wait...",
-                    parse_mode="Markdown"
+                    f"⏳ Anti-bot delays active. Please wait..."
                 )
                 q = await take_survey_exact(client, uid, sid, s)
                 if q:
                     total_q += q
-                    await query.edit_message_text(
+                    await edit_msg(
+                        query,
                         f"✅ *Survey {i+1} completed!*\n"
-                        f"Answered: `{q}` questions.",
-                        parse_mode="Markdown"
+                        f"Answered: `{q}` questions."
                     )
                     await asyncio.sleep(2)
                 else:
                     survey_failed = True
                     break
         else:
-            await query.edit_message_text(
-                f"⚠️ *No eligible campaigns available at this moment.*",
-                parse_mode="Markdown"
+            await edit_msg(
+                query,
+                f"⚠️ *No eligible campaigns available at this moment.*"
             )
             
         if survey_failed:
@@ -517,22 +529,22 @@ async def run_surveys_and_claims(query, user_id: int, uid: str, sid: str, phone:
                 [InlineKeyboardButton("🔄 Retry Surveys", callback_data="retry_surveys")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="admin_menu" if user_id == ADMIN_ID else "confirm_join")]
             ])
-            await query.edit_message_text(
-                f"❌ *Survey Processing Failed!*\n"
+            await edit_msg(
+                query,
+                f"❌ *Survey Completion Failed!*\n"
                 f"════════════════════════════\n"
                 f"Crownit server rejected answers or timed out. Click below to retry:",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
             return
             
         # Claim rewards
         rewards = 0
-        await query.edit_message_text(
+        await edit_msg(
+            query,
             f"⚡ *CLAIM MANAGER*\n"
             f"════════════════════════════\n"
-            f"🎁 *Checking rewards and claiming scratch cards...*",
-            parse_mode="Markdown"
+            f"🎁 *Checking rewards and claiming scratch cards...*"
         )
         rewards = await claim_rewards(client, uid, sid)
         
@@ -541,12 +553,12 @@ async def run_surveys_and_claims(query, user_id: int, uid: str, sid: str, phone:
                 [InlineKeyboardButton("🔄 Retry Claiming Rewards", callback_data="retry_claim")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="admin_menu" if user_id == ADMIN_ID else "confirm_join")]
             ])
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 f"⚠️ *Reward Claiming Failed!*\n"
                 f"════════════════════════════\n"
                 f"Surveys completed successfully, but card claiming failed. Click below to retry:",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
             return
             
@@ -578,23 +590,22 @@ async def run_surveys_and_claims(query, user_id: int, uid: str, sid: str, phone:
             f"🎁 Reward claimed: *₹10 Amazon Gift Card*\n\n"
             f"Earnings will be credited directly to your Crownit wallet."
         )
-        await query.edit_message_text(success_text, reply_markup=kb, parse_mode="Markdown")
+        await edit_msg(query, success_text, reply_markup=kb)
 
 # Unified Callback Query Handler
 async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    
     user_id = query.from_user.id
     data = query.data
     
     if user_id in db_data.get("banned_users", []):
-        await query.edit_message_text("❌ You are banned from using this bot.")
+        await query.answer("❌ You are banned.")
         return
         
     if not data.startswith("admin_user_") and data not in ["dup_continue", "dup_cancel"]:
         context.user_data["state"] = None
         
+    # Force Join checking - Selective Answering (Allows alert popups)
     if data == "confirm_join":
         not_joined = await check_user_channels(user_id, context.bot)
         if not_joined:
@@ -602,34 +613,37 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("✅ Verified successfully!", show_alert=True)
             if user_id == ADMIN_ID:
-                await query.edit_message_text(
+                await edit_msg(
+                    query,
                     "👑 *ADMIN CONTROL PANEL*\n════════════════════════════\nSelect an option below:",
-                    reply_markup=admin_dashboard_kb(),
-                    parse_mode="Markdown"
+                    reply_markup=admin_dashboard_kb()
                 )
             else:
-                await query.edit_message_text(
+                await edit_msg(
+                    query,
                     "💎 *CROWNIT EARNING HUB* 💎\n════════════════════════════\nSelect a command below to start earning:",
-                    reply_markup=user_menu_kb(),
-                    parse_mode="Markdown"
+                    reply_markup=user_menu_kb()
                 )
         return
         
+    # Answer other callbacks immediately to prevent loading spinner lag
+    await query.answer()
+    
     if user_id != ADMIN_ID:
         not_joined = await check_user_channels(user_id, context.bot)
         if not_joined:
             join_msg = "⚠️ *Access Restricted*\n════════════════════════════\nBot use karne ke liye channel join karo:"
-            await query.edit_message_text(join_msg, reply_markup=get_join_keyboard(not_joined), parse_mode="Markdown")
+            await edit_msg(query, join_msg, reply_markup=get_join_keyboard(not_joined))
             return
             
     # --- ROUTING ---
     if data == "register":
-        await query.edit_message_text(
+        await edit_msg(
+            query,
             "📱 *Registration Wizard*\n"
             "════════════════════════════\n"
             "Enter 10-digit Indian Mobile Number:\n\n"
-            "Type `/cancel` to abort.", 
-            parse_mode="Markdown"
+            "Type `/cancel` to abort."
         )
         context.user_data["state"] = "WAITING_FOR_MOBILE"
         
@@ -645,41 +659,41 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎁 Total Rewards: `{u.get('rewards', 0)}`"
         )
         kb = admin_dashboard_kb() if user_id == ADMIN_ID else user_menu_kb()
-        await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+        await edit_msg(query, txt, reply_markup=kb)
         
     elif data == "dup_continue":
         reg_info = context.user_data.get("pending_register")
         if not reg_info:
-            await query.edit_message_text("❌ Session expired. Please try again.", reply_markup=user_menu_kb())
+            await edit_msg(query, "❌ Session expired. Please try again.", reply_markup=user_menu_kb())
             return
             
         mobile = reg_info["phone"]
-        await query.edit_message_text(
+        await edit_msg(
+            query,
             f"📡 *Proceeding with OTP verification...*\n"
             f"════════════════════════════\n"
-            f"📩 *Enter OTP code received on +91{mobile}:*",
-            parse_mode="Markdown"
+            f"📩 *Enter OTP code received on +91{mobile}:*"
         )
         context.user_data["state"] = "WAITING_FOR_OTP"
         
     elif data == "dup_cancel":
         context.user_data.pop("pending_register", None)
-        await query.edit_message_text("❌ Registration cancelled.", reply_markup=user_menu_kb())
+        await edit_msg(query, "❌ Registration cancelled.", reply_markup=user_menu_kb())
         
     elif data == "retry_surveys":
         session = active_sessions.get(user_id)
         if not session:
-            await query.edit_message_text("❌ Session expired. Please register again.", reply_markup=user_menu_kb())
+            await edit_msg(query, "❌ Session expired. Please register again.", reply_markup=user_menu_kb())
             return
         await run_surveys_and_claims(query, user_id, session["uid"], session["sid"], session["phone"])
         
     elif data == "retry_claim":
         session = active_sessions.get(user_id)
         if not session:
-            await query.edit_message_text("❌ Session expired. Please register again.", reply_markup=user_menu_kb())
+            await edit_msg(query, "❌ Session expired. Please register again.", reply_markup=user_menu_kb())
             return
             
-        await query.edit_message_text("🔄 *Retrying reward claim...*", parse_mode="Markdown")
+        await edit_msg(query, "🔄 *Retrying reward claim...*")
         async with httpx.AsyncClient(verify=False) as client:
             rewards = await claim_rewards(client, session["uid"], session["sid"])
             
@@ -691,44 +705,44 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             active_sessions.pop(user_id, None)
             kb = admin_dashboard_kb() if user_id == ADMIN_ID else user_menu_kb()
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 f"🎉 *REWARD CLAIM SUCCESSFUL!*\n"
                 f"════════════════════════════\n"
                 f"📱 Phone: `+91{session['phone']}`\n"
                 f"🎁 Reward claimed: *₹10 Amazon Gift Card*\n\n"
                 f"Earnings will be credited directly to your Crownit account.",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
         else:
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Retry Claiming Rewards", callback_data="retry_claim")],
                 [InlineKeyboardButton("⬅️ Main Menu", callback_data="admin_menu" if user_id == ADMIN_ID else "confirm_join")]
             ])
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "❌ *Reward Claiming Failed Again*\n════════════════════════════\nThe bot failed to claim the reward. Click below to retry.",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
             
     # --- ADMIN CALLBACK ACTIONS ---
     elif user_id == ADMIN_ID:
         if data == "admin_menu":
             users_count = len(db_data["users"])
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 f"👑 *ADMIN CONTROL PANEL*\n"
                 f"════════════════════════════\n"
                 f"👥 Registered Users: `{users_count}`\n\n"
                 f"Select an option below:",
-                reply_markup=admin_dashboard_kb(),
-                parse_mode="Markdown"
+                reply_markup=admin_dashboard_kb()
             )
             
         elif data == "admin_test_user_menu":
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "💎 *CROWNIT EARNING HUB* (Testing Mode)\n════════════════════════════\nSelect a command below to start earning:",
-                reply_markup=user_menu_kb(),
-                parse_mode="Markdown"
+                reply_markup=user_menu_kb()
             )
             
         elif data == "admin_channels":
@@ -746,7 +760,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Toggle Force Join", callback_data="admin_toggle_join")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown", disable_web_page_preview=True)
+            await edit_msg(query, txt, reply_markup=kb)
             
         elif data == "admin_toggle_join":
             cur = db_data["settings"].get("force_join_enabled", True)
@@ -764,17 +778,17 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Toggle Force Join", callback_data="admin_toggle_join")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown", disable_web_page_preview=True)
+            await edit_msg(query, txt, reply_markup=kb)
             
         elif data == "admin_add_channel":
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "➕ *Add Force Join Channel*\n"
                 "════════════════════════════\n"
                 "Send channel details in the following format:\n"
                 "`@channel_username|https://t.me/invite_link` (Must include pipe '|').\n\n"
                 "Bot must be admin in the channel to verify joins.\n"
-                "Type `/cancel` to abort.",
-                parse_mode="Markdown"
+                "Type `/cancel` to abort."
             )
             context.user_data["state"] = "ADMIN_STATE_ADD_CHANNEL"
             
@@ -787,7 +801,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for i, c in enumerate(chans):
                 buttons.append([InlineKeyboardButton(f"❌ {c.get('username')}", callback_data=f"admin_remove_channel_{i}")])
             buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="admin_channels")])
-            await query.edit_message_text("❌ *Select Channel to Delete:*", reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+            await edit_msg(query, "❌ *Select Channel to Delete:*", reply_markup=InlineKeyboardMarkup(buttons))
             
         elif data.startswith("admin_remove_channel_"):
             idx = int(data.split("_")[-1])
@@ -807,46 +821,46 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Toggle Force Join", callback_data="admin_toggle_join")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown", disable_web_page_preview=True)
+            await edit_msg(query, txt, reply_markup=kb)
             
         elif data == "admin_users":
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔍 Search User (Phone / ID)", callback_data="admin_user_lookup_prompt")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "👤 *User Management Dashboard*\n"
                 "════════════════════════════\n"
                 "Search, ban/unban, or reset user registrations to let them redo campaigns.",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
             
         elif data == "admin_user_lookup_prompt":
-            await query.edit_message_text("🔍 Send Telegram User ID or Phone Number (10 digits) to lookup:")
+            await edit_msg(query, "🔍 Send Telegram User ID or Phone Number (10 digits) to lookup:")
             context.user_data["state"] = "ADMIN_STATE_USER_LOOKUP"
             
         elif data == "admin_broadcast_prompt":
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "📊 *Create Broadcast Message*\n"
                 "════════════════════════════\n"
                 "Send the message text you wish to broadcast to all registered bot users. "
                 "Markdown style formatting is supported.\n\n"
-                "Type `/cancel` to abort.",
-                parse_mode="Markdown"
+                "Type `/cancel` to abort."
             )
             context.user_data["state"] = "ADMIN_STATE_BROADCAST_DRAFT"
             
         elif data == "admin_broadcast_confirm":
             draft = admin_session.get("broadcast_draft", "")
             if not draft:
-                await query.edit_message_text("❌ Draft empty. Try again.", reply_markup=admin_dashboard_kb())
+                await edit_msg(query, "❌ Draft empty. Try again.", reply_markup=admin_dashboard_kb())
                 return
             asyncio.create_task(run_broadcast_background(update, context, draft))
             
         elif data == "admin_broadcast_cancel":
             admin_session.pop("broadcast_draft", None)
-            await query.edit_message_text("❌ Broadcast cancelled.", reply_markup=admin_dashboard_kb())
+            await edit_msg(query, "❌ Broadcast cancelled.", reply_markup=admin_dashboard_kb())
             
         elif data == "admin_backup_menu":
             kb = InlineKeyboardMarkup([
@@ -854,21 +868,21 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📥 Restore Database (Upload)", callback_data="admin_restore_prompt")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(
+            await edit_msg(
+                query,
                 "💾 *Backup & Restore Suite*\n"
                 "════════════════════════════\n"
                 "Export the users database as a JSON document or restore it by uploading a backup file.",
-                reply_markup=kb,
-                parse_mode="Markdown"
+                reply_markup=kb
             )
             
         elif data == "admin_restore_prompt":
-            await query.edit_message_text("📥 *Upload crownit_db.json file backup:*\n\nSend the backup document to restore data.")
+            await edit_msg(query, "📥 *Upload crownit_db.json file backup:*\n\nSend the backup document to restore data.")
             context.user_data["state"] = "ADMIN_STATE_RESTORE_DB"
             
         elif data == "admin_export_db":
             try:
-                await query.edit_message_text("⏳ Generating database export...")
+                await edit_msg(query, "⏳ Generating database export...")
                 with open(DB_FILE, "rb") as f:
                     await context.bot.send_document(
                         chat_id=ADMIN_ID,
@@ -903,18 +917,18 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✏️ Edit Max Delay", callback_data="admin_config_delay_max_prompt")],
                 [InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]
             ])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+            await edit_msg(query, txt, reply_markup=kb)
             
         elif data == "admin_config_limit_prompt":
-            await query.edit_message_text("✏️ Enter maximum surveys to run per session (integer):")
+            await edit_msg(query, "✏️ Enter maximum surveys to run per session (integer):")
             context.user_data["state"] = "ADMIN_STATE_CONFIG_LIMIT"
             
         elif data == "admin_config_delay_min_prompt":
-            await query.edit_message_text("✏️ Enter minimum question answering delay in seconds:")
+            await edit_msg(query, "✏️ Enter minimum question answering delay in seconds:")
             context.user_data["state"] = "ADMIN_STATE_CONFIG_DELAY_MIN"
             
         elif data == "admin_config_delay_max_prompt":
-            await query.edit_message_text("✏️ Enter maximum question answering delay in seconds:")
+            await edit_msg(query, "✏️ Enter maximum question answering delay in seconds:")
             context.user_data["state"] = "ADMIN_STATE_CONFIG_DELAY_MAX"
             
         elif data == "admin_stats":
@@ -941,19 +955,21 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🆕 Registered Today: `{registered_today}`"
             )
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Admin Panel", callback_data="admin_menu")]])
-            await query.edit_message_text(txt, reply_markup=kb, parse_mode="Markdown")
+            await edit_msg(query, txt, reply_markup=kb)
 
 # Handle User Moderation Action callback queries
 async def handle_user_actions_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     action = query.data
     target_id = admin_session.get("target_user_id")
     
     if not target_id:
-        await query.edit_message_text("❌ Session expired! Lookup user again.", reply_markup=admin_dashboard_kb())
+        await query.answer("❌ Session expired!", show_alert=True)
+        await edit_msg(query, "❌ Session expired! Lookup user again.", reply_markup=admin_dashboard_kb())
         return
         
+    alert_text = "✅ Operation successful."
+    
     if action == "admin_user_reset":
         if target_id in db_data["users"]:
             db_data["users"][target_id]["status"] = "joined"
@@ -961,24 +977,25 @@ async def handle_user_actions_callbacks(update: Update, context: ContextTypes.DE
             db_data["users"][target_id]["surveys"] = 0
             db_data["users"][target_id]["rewards"] = 0
             await save_db()
-            await query.answer("User registration status reset!", show_alert=True)
+            alert_text = "User registration status reset!"
             
     elif action == "admin_user_ban":
         uid_int = int(target_id)
         if uid_int not in db_data["banned_users"]:
             db_data["banned_users"].append(uid_int)
             await save_db()
-            await query.answer("User banned successfully!", show_alert=True)
+            alert_text = "User banned successfully!"
             
     elif action == "admin_user_unban":
         uid_int = int(target_id)
         if uid_int in db_data["banned_users"]:
             db_data["banned_users"].remove(uid_int)
             await save_db()
-            await query.answer("User unbanned successfully!", show_alert=True)
+            alert_text = "User unbanned successfully!"
             
+    await query.answer(alert_text, show_alert=True)
     admin_session.pop("target_user_id", None)
-    await query.edit_message_text("✅ User modified successfully.", reply_markup=admin_dashboard_kb())
+    await edit_msg(query, "✅ User modified successfully.", reply_markup=admin_dashboard_kb())
 
 # --- USER REGISTRATION LOGIC ---
 
@@ -1034,11 +1051,11 @@ async def handle_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_resp = await crownit_post(client, "/api/users", payload)
         
     if user_resp.get("responseCode") != 1:
-        await msg.edit_text(
+        await edit_msg(
+            msg,
             "❌ *Crownit API Registration Failed.*\n"
             "════════════════════════════\n"
-            "The server rejected the registration details or phone number format.",
-            parse_mode="Markdown"
+            "The server rejected the registration details or phone number format."
         )
         context.user_data["state"] = None
         return
@@ -1055,22 +1072,22 @@ async def handle_mobile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Yes, Continue", callback_data="dup_continue")],
             [InlineKeyboardButton("❌ No, Cancel", callback_data="dup_cancel")]
         ])
-        await msg.edit_text(
+        await edit_msg(
+            msg,
             f"⚠️ *Already Registered on Crownit!*\n"
             f"════════════════════════════\n"
             f"The phone number `+91{mobile}` is already registered in Crownit.\n\n"
             f"Do you want to continue anyway?",
-            reply_markup=kb,
-            parse_mode="Markdown"
+            reply_markup=kb
         )
         context.user_data["state"] = None
     else:
-        await msg.edit_text(
+        await edit_msg(
+            msg,
             f"✅ *Profile Submitted Successfully!*\n"
             f"════════════════════════════\n"
             f"📱 Number: `+91{mobile}`\n"
-            f"📩 *Enter the OTP code received below:*",
-            parse_mode="Markdown"
+            f"📩 *Enter the OTP code received below:*"
         )
         context.user_data["state"] = "WAITING_FOR_OTP"
 
@@ -1097,7 +1114,7 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
         
         if verify.get("responseCode") != 1:
-            await msg.edit_text("❌ Invalid OTP! Verification failed.")
+            await edit_msg(msg, "❌ Invalid OTP! Verification failed.")
             return
             
         ud = verify.get("userDetails", {})
@@ -1111,7 +1128,7 @@ async def handle_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_sessions[user_id] = {"uid": uid, "sid": sid, "phone": phone}
         
         # Set up profile details on Crownit (saves city configuration)
-        await msg.edit_text("✅ Verification successful!\n📍 Setting up profile and city metadata...")
+        await edit_msg(msg, "✅ Verification successful!\n📍 Setting up profile and city metadata...")
         await crownit_put(client, "/api/user/profile", {"city": "Bihar Sharif", "cityId": 1134}, uid, sid)
         await crownit_post(client, "/api/user/milestone", {}, uid, sid)
         
@@ -1303,10 +1320,10 @@ async def handle_admin_restore_db(update: Update, context: ContextTypes.DEFAULT_
         db_data.update(data)
         await save_db()
         context.user_data["state"] = None
-        await msg.edit_text("✅ *Database restored successfully!*", reply_markup=admin_dashboard_kb(), parse_mode="Markdown")
+        await edit_msg(msg, "✅ *Database restored successfully!*", reply_markup=admin_dashboard_kb())
     except Exception as e:
         logger.error(f"Failed to restore DB: {e}")
-        await msg.edit_text(f"❌ Failed to parse or restore database structure: {e}", reply_markup=admin_dashboard_kb())
+        await edit_msg(msg, f"❌ Failed to parse or restore database structure: {e}", reply_markup=admin_dashboard_kb())
 
 # Message router to handle text states dynamically without ConversationHandler
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1420,7 +1437,7 @@ def main():
     # Text Message Handler Router (checks state variables dynamically)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
     
-    print("🤖 Crownit Bot v6.3 Starting - Async Engine and Zero-Lag State Router Ready.")
+    print("🤖 Crownit Bot v6.4 Starting - Async Engine and Zero-Lag State Router Ready.")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
